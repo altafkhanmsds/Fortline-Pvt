@@ -1,0 +1,579 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { createClient } from "@/lib/supabase/client";
+import { useAuth } from "@/hooks/use-auth";
+import { cn } from "@/lib/utils";
+import type { Contact, Deal, ContactNote, Tag, CallWithAgent, CallSummary } from "@/types";
+import {
+  Phone,
+  Mail,
+  Copy,
+  Check,
+  User,
+  Users,
+  Tag as TagIcon,
+  DollarSign,
+  StickyNote,
+  Plus,
+  PhoneCall,
+  PhoneOutgoing,
+  PhoneIncoming,
+  PhoneMissed,
+  Briefcase,
+  Shield,
+} from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { format, formatDistanceToNow } from "date-fns";
+import { useTranslations } from "next-intl";
+import type { Conversation } from "@/types";
+import type { FortlineSalesMember } from "@/types/fortline";
+
+interface ContactSidebarProps {
+  contact: Contact | null;
+  conversation?: Conversation | null;
+  salesMembers?: FortlineSalesMember[];
+  onAssignSalesMember?: (memberId: string | null) => void;
+  className?: string;
+}
+
+function formatTalkTime(totalSeconds: number): string {
+  if (!totalSeconds || totalSeconds <= 0) return "0s";
+  const hrs = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  const parts: string[] = [];
+  if (hrs > 0) parts.push(`${hrs}h`);
+  if (mins > 0) parts.push(`${mins}m`);
+  if (secs > 0 || parts.length === 0) parts.push(`${secs}s`);
+
+  return parts.join(" ");
+}
+
+export function ContactSidebar({
+  contact,
+  conversation,
+  salesMembers,
+  onAssignSalesMember,
+  className,
+}: ContactSidebarProps) {
+  const tSidebar = useTranslations("Inbox.sidebar");
+  const tThread = useTranslations("Inbox.messageThread");
+  const tCalls = useTranslations("Calls");
+
+  const { accountId } = useAuth();
+  const [copied, setCopied] = useState(false);
+  const [deals, setDeals] = useState<Deal[]>([]);
+  const [notes, setNotes] = useState<ContactNote[]>([]);
+  const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>([]);
+  const [callsData, setCallsData] = useState<{
+    calls: CallWithAgent[];
+    summary: CallSummary;
+  } | null>(null);
+  const [newNote, setNewNote] = useState("");
+  const [addingNote, setAddingNote] = useState(false);
+  const [assignedRepId, setAssignedRepId] = useState<string | null>(
+    conversation?.assigned_sales_member_id || contact?.assigned_sales_member_id || null
+  );
+
+  useEffect(() => {
+    setAssignedRepId(
+      conversation?.assigned_sales_member_id || contact?.assigned_sales_member_id || null
+    );
+  }, [conversation?.assigned_sales_member_id, contact?.assigned_sales_member_id]);
+
+  const handleAssignRep = async (newRepId: string | null) => {
+    setAssignedRepId(newRepId);
+    try {
+      const supabase = createClient();
+      if (conversation?.id) {
+        await supabase
+          .from("conversations")
+          .update({ assigned_sales_member_id: newRepId })
+          .eq("id", conversation.id);
+      }
+      if (contact?.id) {
+        await supabase
+          .from("contacts")
+          .update({ assigned_sales_member_id: newRepId })
+          .eq("id", contact.id);
+      }
+      onAssignSalesMember?.(newRepId);
+      const rep = salesMembers?.find((m) => m.id === newRepId);
+      toast.success(rep ? `Assigned to ${rep.name}` : "Lead Unassigned");
+    } catch (err) {
+      console.error("Failed to assign sales rep:", err);
+      toast.error("Failed to update sales rep assignment");
+    }
+  };
+
+  const fetchContactData = useCallback(async () => {
+    if (!contact) return;
+
+    const supabase = createClient();
+
+    // Fetch deals, notes, tags, and student 360 in parallel
+    const [dealsRes, notesRes, tagsRes] = await Promise.all([
+      supabase
+        .from("deals")
+        .select("*, stage:pipeline_stages(*)")
+        .eq("contact_id", contact.id)
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("contact_notes")
+        .select("*")
+        .eq("contact_id", contact.id)
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("contact_tags")
+        .select("id, tag_id, tags(*)")
+        .eq("contact_id", contact.id),
+    ]);
+
+    if (dealsRes.data) setDeals(dealsRes.data);
+    if (notesRes.data) setNotes(notesRes.data);
+    if (tagsRes.data) {
+      const mapped = tagsRes.data
+        .filter((ct: Record<string, unknown>) => ct.tags)
+        .map((ct: Record<string, unknown>) => ({
+          ...(ct.tags as Tag),
+          contact_tag_id: ct.id as string,
+        }));
+      setTags(mapped);
+    }
+
+
+    // Fetch calls lazily without blocking inbox
+    fetch(`/api/calls?contact_id=${contact.id}&limit=3`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) setCallsData(data);
+      })
+      .catch((err) => {
+        console.error("Failed to load calls for contact sidebar:", err);
+      });
+  }, [contact]);
+
+  // Load on contact change. setContactData/setTags run inside async
+  // Supabase callbacks, not synchronously in the effect body.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchContactData();
+  }, [fetchContactData]);
+
+  const handleCopyPhone = useCallback(async () => {
+    const textToCopy =
+      (typeof contact?.phone === "string" && contact.phone.trim()) ||
+      (contact?.metadata &&
+        typeof (contact.metadata as any).remoteJid === "string" &&
+        (contact.metadata as any).remoteJid.trim()) ||
+      "";
+    if (!textToCopy) return;
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Dep is the whole `contact` object so React Compiler's inference agrees
+    }
+  }, [contact]);
+
+  const handleAddNote = useCallback(async () => {
+    if (!contact || !newNote.trim()) return;
+    if (!accountId) return;
+    setAddingNote(true);
+
+    const supabase = createClient();
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    const user = session?.user;
+
+    const { data, error } = await supabase
+      .from("contact_notes")
+      .insert({
+        contact_id: contact.id,
+        account_id: accountId,
+        user_id: user?.id,
+        note_text: newNote.trim(),
+      })
+      .select()
+      .single();
+
+    if (!error && data) {
+      setNotes((prev) => [data, ...prev]);
+      setNewNote("");
+    }
+    setAddingNote(false);
+  }, [contact, newNote, accountId]);
+
+  if (!contact) {
+    return (
+      <div className={cn("flex h-full w-70 xl:w-80 2xl:w-96 items-center justify-center border-l border-border bg-card", className)}>
+        <p className="text-sm text-muted-foreground">{tThread("selectConversation")}</p>
+      </div>
+    );
+  }
+
+  const phoneStr = typeof contact.phone === "string" ? contact.phone.trim() : "";
+  const whatsappJid = typeof (contact as any).whatsapp_jid === "string" ? (contact as any).whatsapp_jid : "";
+  const metadataRemoteJid =
+    contact.metadata &&
+    typeof contact.metadata === "object" &&
+    typeof (contact.metadata as any).remoteJid === "string"
+      ? (contact.metadata as any).remoteJid
+      : "";
+
+  const isGroup =
+    conversation?.chat_type === "group" ||
+    phoneStr.includes("@g.us") ||
+    phoneStr.startsWith("120363") ||
+    phoneStr.startsWith("+120363") ||
+    whatsappJid.endsWith("@g.us") ||
+    metadataRemoteJid.endsWith("@g.us");
+
+  const displayName =
+    (typeof contact.name === "string" &&
+      contact.name.trim() &&
+      !contact.name.includes("@lid") &&
+      !contact.name.includes("@s.whatsapp.net"))
+      ? contact.name.trim()
+      : (contact.metadata &&
+         typeof (contact.metadata as any).pushName === "string" &&
+         (contact.metadata as any).pushName.trim())
+      ? (contact.metadata as any).pushName.trim()
+      : phoneStr && !phoneStr.includes("@lid") && !phoneStr.includes("@g.us")
+      ? phoneStr
+      : isGroup
+      ? "WhatsApp Group"
+      : "WhatsApp Contact";
+
+  const initials = (displayName.trim().charAt(0) || (isGroup ? "G" : "W")).toUpperCase();
+
+  return (
+    <div className={cn("flex h-full w-70 xl:w-80 2xl:w-96 flex-col border-l border-border bg-card", className)}>
+      <ScrollArea className="flex-1">
+        <div className="p-4">
+          {/* Contact Info */}
+          <div className="flex flex-col items-center text-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
+              {contact.avatar_url ? (
+                <img
+                  src={contact.avatar_url}
+                  alt={displayName}
+                  className="h-16 w-16 rounded-full object-cover"
+                />
+              ) : isGroup ? (
+                <Users className="h-8 w-8 text-primary" />
+              ) : (
+                initials
+              )}
+            </div>
+            <h3 className="mt-3 text-sm font-semibold text-foreground">
+              {displayName}
+            </h3>
+            {isGroup && (
+              <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-500 border border-blue-500/20">
+                <Users className="h-3 w-3" />
+                <span>WhatsApp Group</span>
+              </div>
+            )}
+            {contact.category && (
+              <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary border border-primary/20">
+                <Briefcase className="h-3 w-3" />
+                <span className="capitalize">{contact.category.replace('_', ' ')}</span>
+              </div>
+            )}
+            {/* Assigned Sales Representative Selector */}
+            <div className="mt-3 w-full px-2">
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground flex items-center justify-center gap-1 mb-1.5">
+                <Users className="h-3 w-3 text-primary" />
+                Assigned Sales Rep
+              </label>
+              <select
+                value={assignedRepId || ""}
+                onChange={(e) => handleAssignRep(e.target.value || null)}
+                className="w-full h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary cursor-pointer text-center truncate font-medium"
+              >
+                <option value="">Unassigned (Direct Lead)</option>
+                {(salesMembers || []).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name} • {m.division}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {contact.is_spam && (
+              <span className="mt-1.5 inline-flex items-center rounded bg-rose-500/10 px-2 py-0.5 text-[10px] font-semibold text-rose-500 border border-rose-500/20 uppercase tracking-wide">
+                Spam / Blocked
+              </span>
+            )}
+            {contact.company && (
+              <p className="mt-1 text-xs text-muted-foreground">{contact.company}</p>
+            )}
+          </div>
+
+          {/* Phone / Group Channel */}
+          <div className="mt-4 space-y-2">
+            {isGroup ? (
+              <div className="flex w-full items-center gap-2 rounded-lg bg-muted/40 p-2.5 text-xs text-muted-foreground">
+                <Users className="h-4 w-4 shrink-0 text-primary" />
+                <div className="min-w-0 flex-1 text-left">
+                  <div className="font-medium text-foreground">Group Channel</div>
+                  <div
+                    className="truncate text-[10px] text-muted-foreground"
+                    title={phoneStr || metadataRemoteJid || "WhatsApp Group"}
+                  >
+                    {phoneStr || metadataRemoteJid || "WhatsApp Group"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopyPhone}
+                  className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  title="Copy Group ID"
+                >
+                  {copied ? (
+                    <Check className="h-3.5 w-3.5 text-primary" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleCopyPhone}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
+              >
+                <Phone className="h-4 w-4 text-muted-foreground shrink-0" />
+                <span className="flex-1 text-left truncate">
+                  {phoneStr ||
+                    (metadataRemoteJid
+                      ? metadataRemoteJid.includes("@lid")
+                        ? "WhatsApp Direct (LID)"
+                        : metadataRemoteJid
+                      : "WhatsApp Contact")}
+                </span>
+                {copied ? (
+                  <Check className="h-3 w-3 text-primary shrink-0" />
+                ) : (
+                  <Copy className="h-3 w-3 text-muted-foreground shrink-0" />
+                )}
+              </button>
+            )}
+
+            {contact.email && (
+              <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground">
+                <Mail className="h-4 w-4 text-muted-foreground" />
+                <span className="truncate">{contact.email}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Divider */}
+          <div className="my-4 border-t border-border" />
+
+          {/* Tags */}
+          <div>
+            <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              <TagIcon className="h-3 w-3" />
+              {tSidebar("tags")}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              {tags.length === 0 ? (
+                <p className="px-1 text-xs text-muted-foreground">{tSidebar("noTags")}</p>
+              ) : (
+                tags.map((tag) => (
+                  <span
+                    key={tag.contact_tag_id}
+                    className="rounded-full px-2 py-0.5 text-[10px] font-medium"
+                    style={{
+                      backgroundColor: `${tag.color}20`,
+                      color: tag.color,
+                    }}
+                  >
+                    {tag.name}
+                  </span>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div className="my-4 border-t border-border" />
+
+          {/* Calls Section */}
+          <div>
+            <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              <PhoneCall className="h-3 w-3" />
+              {tCalls("contactPanel.title")}
+            </div>
+
+            <div className="mt-2 space-y-2">
+              {!callsData || callsData.summary.total_calls === 0 ? (
+                <p className="px-1 text-xs text-muted-foreground">
+                  {tCalls("contactPanel.noCalls")}
+                </p>
+              ) : (
+                <>
+                  {/* Summary 3 lines */}
+                  <div className="space-y-1 rounded-lg bg-muted/70 px-3 py-2 text-xs">
+                    <p className="font-medium text-foreground">
+                      📞 {callsData.summary.total_calls} calls — {callsData.summary.answered} answered, {callsData.summary.missed_or_unanswered} missed
+                    </p>
+                    <p className="text-muted-foreground">
+                      Total talk time: {formatTalkTime(callsData.summary.total_talk_seconds)}
+                    </p>
+                    {callsData.summary.last_call_at && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Last call: {formatDistanceToNow(new Date(callsData.summary.last_call_at), { addSuffix: true })} by {callsData.calls[0]?.agent?.full_name || "Agent"}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Last 3 calls rows */}
+                  <div className="space-y-1 pt-1">
+                    {callsData.calls.map((call) => {
+                      const Icon =
+                        call.direction === "missed"
+                          ? PhoneMissed
+                          : call.direction === "incoming"
+                          ? PhoneIncoming
+                          : PhoneOutgoing;
+
+                      const iconColor =
+                        call.direction === "missed"
+                          ? "text-rose-500"
+                          : call.direction === "incoming"
+                          ? "text-blue-500"
+                          : "text-emerald-500";
+
+                      return (
+                        <div
+                          key={call.id}
+                          className="flex items-center justify-between rounded-md bg-muted/40 px-2.5 py-1.5 text-[11px] text-muted-foreground"
+                        >
+                          <div className="flex items-center gap-1.5 truncate">
+                            <Icon className={cn("h-3 w-3 shrink-0", iconColor)} />
+                            <span className="capitalize text-foreground font-medium">
+                              {tCalls(`directions.${call.direction}`)}
+                            </span>
+                            <span>•</span>
+                            <span>{formatTalkTime(call.duration_seconds)}</span>
+                            <span>•</span>
+                            <span className="truncate">
+                              {tCalls(`outcomes.${call.outcome}`)}
+                            </span>
+                          </div>
+                          <span className="shrink-0 text-[10px]">
+                            {formatDistanceToNow(new Date(call.call_started_at), {
+                              addSuffix: true,
+                            })}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div className="my-4 border-t border-border" />
+
+          {/* Active Deals */}
+          <div>
+            <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              <DollarSign className="h-3 w-3" />
+              {tSidebar("deals")}
+            </div>
+            <div className="mt-2 space-y-2">
+              {deals.length === 0 ? (
+                <p className="px-1 text-xs text-muted-foreground">{tSidebar("noDeals")}</p>
+              ) : (
+                deals.map((deal) => (
+                  <div
+                    key={deal.id}
+                    className="rounded-lg bg-muted px-3 py-2"
+                  >
+                    <p className="text-sm font-medium text-foreground">
+                      {deal.title}
+                    </p>
+                    <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
+                      <span>
+                        {deal.currency ?? "$"}
+                        {deal.value.toLocaleString()}
+                      </span>
+                      {deal.stage && (
+                        <span
+                          className="rounded-full px-1.5 py-0.5 text-[10px]"
+                          style={{
+                            backgroundColor: `${deal.stage.color}20`,
+                            color: deal.stage.color,
+                          }}
+                        >
+                          {deal.stage.name}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div className="my-4 border-t border-border" />
+
+          {/* Notes */}
+          <div>
+            <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              <StickyNote className="h-3 w-3" />
+              {tSidebar("notes")}
+            </div>
+            <div className="mt-2">
+              <div className="flex gap-2">
+                <textarea
+                  value={newNote}
+                  onChange={(e) => setNewNote(e.target.value)}
+                  placeholder={tSidebar("addNotePlaceholder")}
+                  rows={2}
+                  className="flex-1 resize-none rounded-lg border border-border bg-muted px-3 py-2 text-xs text-foreground placeholder-muted-foreground outline-none focus:border-primary/50"
+                />
+                <Button
+                  size="sm"
+                  className="h-auto bg-primary px-2 hover:bg-primary/90"
+                  onClick={handleAddNote}
+                  disabled={!newNote.trim() || addingNote}
+                >
+                  <Plus className="h-3 w-3" />
+                </Button>
+              </div>
+
+              <div className="mt-2 space-y-2">
+                {notes.map((note) => (
+                  <div
+                    key={note.id}
+                    className="rounded-lg bg-muted px-3 py-2"
+                  >
+                    <p className="whitespace-pre-wrap text-xs text-muted-foreground">
+                      {note.note_text}
+                    </p>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      {format(new Date(note.created_at), "MMM d, yyyy HH:mm")}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}

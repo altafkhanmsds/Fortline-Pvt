@@ -1,0 +1,1444 @@
+"use client";
+
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { createClient } from "@/lib/supabase/client";
+import { useAuth } from "@/hooks/use-auth";
+import { usePresence } from "@/hooks/use-presence";
+import { PresenceDot } from "@/components/presence/presence-dot";
+import { presenceLabel } from "@/lib/presence";
+import { cn } from "@/lib/utils";
+import type {
+  Conversation,
+  Message,
+  MessageReaction,
+  Contact,
+  ConversationStatus,
+  MessageTemplate,
+  Profile,
+  InteractiveMessagePayload,
+} from "@/types";
+import {
+  MessageCircle,
+  Check,
+  Clock,
+  ArrowLeft,
+  RefreshCw,
+  PanelRightOpen,
+  PanelRightClose,
+  Phone,
+  Info,
+  History,
+  Users,
+  MoreVertical,
+} from "lucide-react";
+import { format, isToday, isYesterday, differenceInHours } from "date-fns";
+import { useTranslations } from "next-intl";
+import { useCan } from "@/hooks/use-can";
+import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+} from "@/components/ui/sheet";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { MessageBubble } from "./message-bubble";
+import { MessageActions } from "./message-actions";
+import { MediaLightbox } from "./media-lightbox";
+import { collectMediaGallery } from "@/lib/media/gallery";
+import {
+  MessageComposer,
+  CHAT_MEDIA_BUCKET,
+  type SendMediaPayload,
+} from "./message-composer";
+import { deleteAccountMedia } from "@/lib/storage/upload-media";
+import { TemplatePicker } from "./template-picker";
+import { AiThreadBanner } from "./ai-thread-banner";
+import { buildReplyPreview } from "./reply-quote";
+import { CallMessageChip } from "./call-message-chip";
+import { LogCallDialog } from "./log-call-dialog";
+import { ContactSidebar } from "./contact-sidebar";
+import { toast } from "sonner";
+
+import type { FortlineSalesMember } from "@/types/fortline";
+
+interface ReplyDraft {
+  id: string;
+  authorLabel: string;
+  preview: string;
+}
+
+function renderTemplateBody(body: string, params: string[]): string {
+  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
+    const idx = Number(raw) - 1;
+    return params[idx] ?? `{{${raw}}}`;
+  });
+}
+
+interface MessageThreadProps {
+  conversation: Conversation | null;
+  contact: Contact | null;
+  messages: Message[];
+  salesMembers?: FortlineSalesMember[];
+  onAssignSalesMember?: (memberId: string | null) => void;
+  onMessagesLoaded: (messages: Message[]) => void;
+  onNewMessage: (message: Message) => void;
+  onUpdateMessage: (id: string, updates: Partial<Message>) => void;
+  onStatusChange: (conversationId: string, status: ConversationStatus) => void;
+  onAssignChange: (
+    conversationId: string,
+    assignedAgentId: string | null,
+  ) => void;
+  /**
+   * On mobile, the thread is shown full-screen with the conversation list
+   * hidden. This callback lets the page deselect the active conversation
+   * and reveal the list again. Rendered as a back-arrow in the header on
+   * mobile only.
+   */
+  onBack?: () => void;
+  /**
+   * Increment to force the messages + reactions fetch effects to refire.
+   * Parent bumps this on realtime reconnect / tab visibility → visible
+   * so the open thread catches up on any events sent while the WS was
+   * disconnected or the tab was throttled. Optional so existing callers
+   * keep working.
+   */
+  resyncToken?: number;
+  /**
+   * Fired by the manual-refresh button in the thread header. The parent
+   * typically bumps the same `resyncToken` it controls — this gives the
+   * user a way to force a refetch when they suspect realtime missed an
+   * event (or they're impatient). Optional so existing callers keep
+   * working; the button is only rendered when this is provided.
+   */
+  onRefresh?: () => void;
+  /**
+   * Desktop-only contact-panel toggle. The page owns the open/closed
+   * state (it's the one that renders the sidebar), so the thread just
+   * reflects it and asks the page to flip it. Both optional so existing
+   * callers keep working; the toggle button only renders when
+   * `onToggleContactPanel` is wired up.
+   */
+  contactPanelOpen?: boolean;
+  onToggleContactPanel?: () => void;
+}
+
+function formatDateSeparator(dateStr: string, t: ReturnType<typeof useTranslations>): string {
+  const date = new Date(dateStr);
+  if (isToday(date)) return t("today");
+  if (isYesterday(date)) return t("yesterday");
+  return format(date, "MMMM d, yyyy");
+}
+
+function groupMessagesByDate(messages: Message[]) {
+  const groups: { date: string; messages: Message[] }[] = [];
+  let currentDate = "";
+
+  for (const msg of messages) {
+    const day = format(new Date(msg.created_at), "yyyy-MM-dd");
+    if (day !== currentDate) {
+      currentDate = day;
+      groups.push({ date: msg.created_at, messages: [msg] });
+    } else {
+      groups[groups.length - 1].messages.push(msg);
+    }
+  }
+
+  return groups;
+}
+
+const STATUS_OPTIONS: { label: string; value: ConversationStatus; color: string }[] = [
+  { label: "Open", value: "open", color: "text-primary" },
+  { label: "Pending", value: "pending", color: "text-amber-400" },
+  { label: "Closed", value: "closed", color: "text-muted-foreground" },
+];
+
+/**
+ * WhatsApp-style doodle background applied to the chat area (both the
+ * active thread and the empty state). The SVG tile lives at
+ * `/public/inbox-doodle.svg`; the slate-950 colour sits underneath so
+ * the doodles read as a subtle pattern rather than a stark grid.
+ *
+ * Defined once at module scope so the two render paths can't drift —
+ * if we ever switch the asset, both spots update together.
+ */
+const DOODLE_BG_CLASSES =
+  "bg-background bg-[url('/inbox-doodle.svg')] bg-repeat";
+
+export function MessageThread({
+  conversation,
+  contact,
+  messages,
+  salesMembers,
+  onAssignSalesMember,
+  onMessagesLoaded,
+  onNewMessage,
+  onUpdateMessage,
+  onStatusChange,
+  onAssignChange,
+  onBack,
+  resyncToken = 0,
+  onRefresh,
+  contactPanelOpen,
+  onToggleContactPanel,
+}: MessageThreadProps) {
+  const t = useTranslations("Inbox.messageThread");
+  const tTimer = useTranslations("Inbox.sessionTimer");
+  const tQuote = useTranslations("Inbox.replyQuote");
+  const tCalls = useTranslations("Calls");
+
+  const { user } = useAuth();
+  const canLogCall = useCan("log-calls");
+  const { getPresence, getRow, now } = usePresence();
+  const [loading, setLoading] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [logCallOpen, setLogCallOpen] = useState(false);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [reactions, setReactions] = useState<MessageReaction[]>([]);
+  // Purely visual spin state for the manual-refresh button. The actual
+  // refetch is fire-and-forget through `onRefresh` (which bumps the
+  // parent's resyncToken); the 700ms spin is just feedback so the click
+  // doesn't feel like a no-op. Cleared via the timer ref on unmount.
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (refreshTimerRef.current !== null) {
+        clearTimeout(refreshTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleRefreshClick = useCallback(() => {
+    if (isRefreshing || !onRefresh) return;
+    setIsRefreshing(true);
+    onRefresh();
+    refreshTimerRef.current = setTimeout(() => {
+      setIsRefreshing(false);
+      refreshTimerRef.current = null;
+    }, 700);
+  }, [isRefreshing, onRefresh]);
+
+  const conversationId = conversation?.id;
+  const [isSyncingHistory, setIsSyncingHistory] = useState(false);
+  const handleSyncHistory = useCallback(async () => {
+    if (!conversationId || isSyncingHistory) return;
+    setIsSyncingHistory(true);
+    try {
+      const res = await fetch("/api/gateway/sync-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversationId }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast.success(`Synced ${data.syncedCount || 0} messages from WhatsApp`);
+        if (onRefresh) onRefresh();
+      } else {
+        toast.error(data.error || "Failed to sync chat history");
+      }
+    } catch (err: any) {
+      toast.error(err.message || "Failed to sync history");
+    } finally {
+      setIsSyncingHistory(false);
+    }
+  }, [conversationId, isSyncingHistory, onRefresh]);
+  const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
+  const [editingMessage, setEditingMessage] = useState<Message | null>(null);
+  const [mobileContactOpen, setMobileContactOpen] = useState(false);
+
+  const handleStartEdit = useCallback((msg: Message) => {
+    setReplyTo(null);
+    setEditingMessage(msg);
+  }, []);
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingMessage(null);
+  }, []);
+
+  const handleSaveEdit = useCallback(
+    async (messageId: string, newText: string) => {
+      if (!newText.trim()) return;
+      const targetMsg = messages.find((m) => m.id === messageId);
+      if (!targetMsg) return;
+
+      const now = new Date().toISOString();
+      const updatedPayload = {
+        ...(typeof targetMsg.interactive_payload === "object" &&
+        targetMsg.interactive_payload !== null
+          ? (targetMsg.interactive_payload as unknown as Record<string, unknown>)
+          : {}),
+        is_edited: true,
+        edited_at: now,
+      };
+
+      onUpdateMessage(messageId, {
+        content_text: newText,
+        interactive_payload: updatedPayload as unknown as InteractiveMessagePayload,
+      });
+
+      setEditingMessage(null);
+
+      try {
+        const supabase = createClient();
+        const { error } = await supabase
+          .from("messages")
+          .update({
+            content_text: newText,
+            interactive_payload: updatedPayload,
+          })
+          .eq("id", messageId);
+
+        if (error) {
+          console.error("Failed to update message in database:", error);
+          toast.error("Failed to save message edit");
+        } else {
+          toast.success("Message edited successfully");
+        }
+      } catch (err) {
+        console.error("Error editing message:", err);
+        toast.error("Failed to edit message");
+      }
+    },
+    [messages, onUpdateMessage]
+  );
+
+  // Which attachment the media viewer is showing. Lives here rather than in
+  // the bubble so the viewer can page through every image/video in the
+  // thread (issue #373). Paired with the conversation it belongs to and read
+  // back through that check below, so switching threads closes the viewer
+  // without an effect racing the messages refetch.
+  const [openMedia, setOpenMedia] = useState<{
+    conversationId: string;
+    messageId: string;
+  } | null>(null);
+
+  // Profiles are bounded by RLS to rows the current user is allowed to
+  // see — today that's just the current user, but the dropdown keeps the
+  // shape ready for shared-team workspaces without a refactor.
+  useEffect(() => {
+    let cancelled = false;
+    const supabase = createClient();
+    supabase
+      .from("profiles")
+      .select("*")
+      .order("full_name")
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error(
+            `Failed to fetch profiles: ${error.message || error.code || "Unknown error"}`,
+            error
+          );
+          return;
+        }
+        setProfiles((data as Profile[]) ?? []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Determine if this conversation is running through a QR Gateway / sales rep phone line.
+  // Meta Cloud API enforces a strict 24-hour customer window where only templates can be sent.
+  // Direct phone QR Gateway (Evolution API) channels do NOT have any 24-hour restriction.
+  const isQrGateway = Boolean(
+    conversation?.whatsapp_channel_id ||
+    conversation?.assigned_sales_member_id ||
+    conversation?.assigned_sales_member ||
+    !conversation?.channel_phone_number_id
+  );
+
+  // 24-hour session timer — only applies to official Meta Cloud API channels
+  const sessionInfo = useMemo(() => {
+    if (isQrGateway) {
+      return { expired: false, remaining: "" };
+    }
+
+    if (!messages.length) return { expired: false, remaining: "" };
+
+    // Find last customer message
+    const lastCustomerMsg = [...messages]
+      .reverse()
+      .find((m) => m.sender_type === "customer" || (m.sender_type as string) === "contact");
+
+    if (!lastCustomerMsg) return { expired: true, remaining: "No customer messages" };
+
+    const hoursSince = differenceInHours(new Date(), new Date(lastCustomerMsg.created_at));
+    const expired = hoursSince >= 24;
+
+    if (expired) {
+      return { expired: true, remaining: tTimer("expired") };
+    }
+
+    const hoursLeft = 24 - hoursSince;
+    const remaining =
+      hoursLeft >= 1
+        ? tTimer("xhRemaining", { hours: Math.floor(hoursLeft) })
+        : tTimer("xmRemaining", { minutes: Math.floor(hoursLeft * 60) });
+
+    return { expired, remaining };
+  }, [messages, tTimer, isQrGateway]);
+
+  // Store latest callback in a ref so fetchMessages doesn't need to
+  // depend on `onMessagesLoaded` — otherwise parent re-renders cause
+  // fetchMessages to change → useEffect re-fires → refetch → realtime
+  // UPDATE on conversations.unread_count → parent re-renders → LOOP.
+  // The ref is written inside an effect so the mutation doesn't happen
+  // during render (React 19 refs rule); consumers only read `.current`
+  // inside the async fetch completion, which runs after the render.
+  const onMessagesLoadedRef = useRef(onMessagesLoaded);
+  useEffect(() => {
+    onMessagesLoadedRef.current = onMessagesLoaded;
+  });
+
+  const hasUnread = (conversation?.unread_count ?? 0) > 0;
+
+  const mediaMessageId =
+    openMedia && openMedia.conversationId === conversationId
+      ? openMedia.messageId
+      : null;
+  const handleMediaChange = useCallback(
+    (messageId: string | null) => {
+      setOpenMedia(
+        messageId && conversationId ? { conversationId, messageId } : null,
+      );
+    },
+    [conversationId],
+  );
+
+  // Fetch messages whenever the selected conversation changes. Kept
+  // separate from the unread-reset effect so that incoming messages
+  // arriving while the thread is open don't trigger a full refetch —
+  // they only flip hasUnread, which only the reset effect listens to.
+  useEffect(() => {
+    if (!conversationId) return;
+
+    const supabase = createClient();
+    let cancelled = false;
+
+    (async () => {
+      setLoading(true);
+
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true });
+
+      if (cancelled) return;
+
+      if (error) {
+        console.error("Failed to fetch messages:", error);
+      } else {
+        const normalized = (data ?? []).map((m: any) => ({
+          ...m,
+          content_text: m.content_text ?? m.content ?? "",
+          content_type:
+            m.content_type ??
+            (m.media_url ? m.media_type || "image" : "text"),
+          sender_type:
+            m.sender_type === "contact"
+              ? "customer"
+              : m.sender_type === "user"
+              ? "agent"
+              : m.sender_type,
+        }));
+        onMessagesLoadedRef.current(normalized as Message[]);
+      }
+
+      if (!cancelled) setLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // `resyncToken` is included so the parent can force a refetch when
+    // the realtime channel reconnects or the tab regains focus —
+    // realtime is best-effort and any message events sent while the WS
+    // was disconnected or throttled are otherwise lost.
+  }, [conversationId, resyncToken]);
+
+  // Reactions fetch — pulls the current state from the DB. Kept separate
+  // from the channel subscription below so a `resyncToken` bump just
+  // refetches the rows without also tearing down and rebuilding the
+  // realtime channel.
+  useEffect(() => {
+    if (!conversationId) {
+      setReactions([]);
+      return;
+    }
+    const supabase = createClient();
+    let cancelled = false;
+
+    (async () => {
+      const { data, error } = await supabase
+        .from("message_reactions")
+        .select("*")
+        .eq("conversation_id", conversationId);
+      if (cancelled) return;
+      if (error) {
+        if (
+          error.code === "PGRST205" ||
+          error.code === "42P01" ||
+          error.message?.includes("schema cache")
+        ) {
+          setReactions([]);
+          return;
+        }
+        console.warn("Failed to fetch reactions:", error.message || error.code || "Unknown error");
+        return;
+      }
+      setReactions((data as MessageReaction[]) ?? []);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, resyncToken]);
+
+  // Reactions realtime subscription per conversation. Subscribing here
+  // (not at the page level) keeps the channel scoped to the visible
+  // conversation and avoids cross-conversation chatter on a busy inbox.
+  useEffect(() => {
+    if (!conversationId) return;
+    const supabase = createClient();
+
+    const channel = supabase
+      .channel(`reactions:${conversationId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "message_reactions",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const row = payload.new as MessageReaction;
+          setReactions((prev) => {
+            if (prev.some((r) => r.id === row.id)) return prev;
+            // Swap any matching optimistic temp row for the real one so
+            // the pill doesn't double up after a successful POST.
+            const tempIdx = prev.findIndex(
+              (r) =>
+                r.id.startsWith("temp-") &&
+                r.message_id === row.message_id &&
+                r.actor_type === row.actor_type &&
+                r.actor_id === row.actor_id,
+            );
+            if (tempIdx >= 0) {
+              const copy = prev.slice();
+              copy[tempIdx] = row;
+              return copy;
+            }
+            return [...prev, row];
+          });
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "message_reactions",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const row = payload.new as MessageReaction;
+          setReactions((prev) => prev.map((r) => (r.id === row.id ? row : r)));
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "message_reactions",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const old = payload.old as Partial<MessageReaction>;
+          if (!old?.id) return;
+          setReactions((prev) => prev.filter((r) => r.id !== old.id));
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [conversationId]);
+
+  // Clear any in-progress reply draft when the active conversation changes —
+  // a quote pulled from conversation A shouldn't bleed into conversation B.
+  useEffect(() => {
+    setReplyTo(null);
+  }, [conversationId]);
+
+  // Reset the server-side unread_count to 0 whenever an unread count
+  // surfaces on the active conversation — covers both (a) opening a
+  // conversation that had unread messages and (b) new messages arriving
+  // while the user is already viewing the thread (webhook server-bumps
+  // unread_count to N+1; the realtime UPDATE propagates it into the
+  // client, which re-runs this effect and flips it back to 0).
+  //
+  // Guarding on hasUnread prevents the eq-update loop: once unread_count
+  // is 0 the condition is false, so no further UPDATE is issued.
+  useEffect(() => {
+    if (!conversationId || !hasUnread) return;
+    const supabase = createClient();
+    supabase
+      .from("conversations")
+      .update({ unread_count: 0 })
+      .eq("id", conversationId)
+      .then(({ error }) => {
+        if (error) console.error("Failed to reset unread_count:", error);
+      });
+  }, [conversationId, hasUnread]);
+
+  // Auto-scroll to bottom on new messages
+  useEffect(() => {
+    if (scrollRef.current) {
+      const el = scrollRef.current;
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages]);
+
+  const handleSend = useCallback(
+    async (text: string, replyToId?: string) => {
+      if (!conversation) return;
+
+      const tempId = `temp-${Date.now()}`;
+
+      // Optimistic update — shows the message immediately with "sending" status
+      const optimisticMsg: Message = {
+        id: tempId,
+        conversation_id: conversation.id,
+        sender_type: "agent",
+        content_type: "text",
+        content_text: text,
+        status: "sending",
+        created_at: new Date().toISOString(),
+        reply_to_message_id: replyToId,
+      };
+      onNewMessage(optimisticMsg);
+      setReplyTo(null);
+
+      try {
+        const res = await fetch("/api/whatsapp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            message_type: "text",
+            content_text: text,
+            reply_to_message_id: replyToId,
+          }),
+        });
+
+        const payload = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const reason = payload?.error || `HTTP ${res.status}`;
+          console.error("Failed to send message:", reason);
+          toast.error(`Failed to send: ${reason}`);
+          // Mark the optimistic bubble as failed so the user sees what happened
+          onUpdateMessage(tempId, { status: "failed" });
+          return;
+        }
+
+        // Success — the realtime INSERT event will replace the temp bubble
+        // with the real DB row. If realtime hasn't arrived yet, at least
+        // flip status to 'sent' so the UI stops showing "sending".
+        onUpdateMessage(tempId, { status: "sent" });
+      } catch (err) {
+        console.error("Failed to send message:", err);
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Failed to send: ${reason}`);
+        onUpdateMessage(tempId, { status: "failed" });
+      }
+    },
+    [conversation, onNewMessage, onUpdateMessage]
+  );
+
+  const handleSendMedia = useCallback(
+    async (payload: SendMediaPayload) => {
+      if (!conversation) return;
+
+      // Documents show their filename in our own bubble (and to the
+      // recipient as the Meta caption when no caption was typed); other
+      // kinds use the caption as-is. Audio carries no caption.
+      const contentText =
+        payload.kind === "document"
+          ? payload.caption || payload.filename || "Document"
+          : payload.caption;
+
+      const tempId = `temp-${Date.now()}`;
+      const optimisticMsg: Message = {
+        id: tempId,
+        conversation_id: conversation.id,
+        sender_type: "agent",
+        content_type: payload.kind,
+        content_text: contentText,
+        media_url: payload.mediaUrl,
+        status: "sending",
+        created_at: new Date().toISOString(),
+        reply_to_message_id: payload.replyToId,
+      };
+      onNewMessage(optimisticMsg);
+      setReplyTo(null);
+
+      try {
+        const res = await fetch("/api/whatsapp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            message_type: payload.kind,
+            media_url: payload.mediaUrl,
+            content_text: contentText,
+            filename: payload.filename,
+            reply_to_message_id: payload.replyToId,
+          }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const reason = data?.error || `HTTP ${res.status}`;
+          console.error("Failed to send media:", reason);
+          toast.error(`Failed to send: ${reason}`);
+          onUpdateMessage(tempId, { status: "failed" });
+          // The upload never reached the recipient — GC the orphaned
+          // object rather than leaving it in the public bucket forever.
+          void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
+          return;
+        }
+
+        onUpdateMessage(tempId, { status: "sent" });
+      } catch (err) {
+        console.error("Failed to send media:", err);
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Failed to send: ${reason}`);
+        onUpdateMessage(tempId, { status: "failed" });
+        void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
+      }
+    },
+    [conversation, onNewMessage, onUpdateMessage],
+  );
+
+  const handleSendInteractive = useCallback(
+    async (payload: InteractiveMessagePayload, replyToId?: string) => {
+      if (!conversation) return;
+
+      const tempId = `temp-${Date.now()}`;
+      // Optimistic bubble — renders the buttons/list immediately via the
+      // interactive_payload, same as the persisted row will.
+      const optimisticMsg: Message = {
+        id: tempId,
+        conversation_id: conversation.id,
+        sender_type: "agent",
+        content_type: "interactive",
+        content_text: payload.body,
+        interactive_payload: payload,
+        status: "sending",
+        created_at: new Date().toISOString(),
+        reply_to_message_id: replyToId,
+      };
+      onNewMessage(optimisticMsg);
+
+      try {
+        const res = await fetch("/api/whatsapp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            message_type: "interactive",
+            interactive_payload: payload,
+            reply_to_message_id: replyToId,
+          }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const reason = data?.error || `HTTP ${res.status}`;
+          console.error("Failed to send interactive message:", reason);
+          toast.error(`Failed to send: ${reason}`);
+          onUpdateMessage(tempId, { status: "failed" });
+          return;
+        }
+
+        onUpdateMessage(tempId, { status: "sent" });
+      } catch (err) {
+        console.error("Failed to send interactive message:", err);
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Failed to send: ${reason}`);
+        onUpdateMessage(tempId, { status: "failed" });
+      }
+    },
+    [conversation, onNewMessage, onUpdateMessage],
+  );
+
+  const handleStatusChange = useCallback(
+    async (status: ConversationStatus) => {
+      if (!conversation) return;
+
+      const supabase = createClient();
+      await supabase
+        .from("conversations")
+        .update({ status })
+        .eq("id", conversation.id);
+
+      onStatusChange(conversation.id, status);
+    },
+    [conversation, onStatusChange]
+  );
+
+  const handleOpenTemplates = useCallback(() => {
+    setTemplateModalOpen(true);
+  }, []);
+
+  const handleSendTemplate = useCallback(
+    async (
+      template: MessageTemplate,
+      values: {
+        body: string[];
+        headerText?: string;
+        buttonParams?: Record<number, string>;
+      },
+    ) => {
+      if (!conversation) return;
+
+      const renderedBody = renderTemplateBody(template.body_text, values.body);
+      const tempId = `temp-${Date.now()}`;
+
+      const optimisticMsg: Message = {
+        id: tempId,
+        conversation_id: conversation.id,
+        sender_type: "agent",
+        content_type: "template",
+        content_text: renderedBody,
+        template_name: template.name,
+        status: "sending",
+        created_at: new Date().toISOString(),
+      };
+      onNewMessage(optimisticMsg);
+
+      try {
+        const res = await fetch("/api/whatsapp/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversation_id: conversation.id,
+            message_type: "template",
+            template_name: template.name,
+            template_language: template.language,
+            // Structured params drive the new send-builder path
+            // (header media + URL button substitution). Body values
+            // are mirrored under both shapes so the route can fall
+            // back if the template row isn't found locally.
+            template_message_params: {
+              body: values.body,
+              headerText: values.headerText,
+              buttonParams: values.buttonParams,
+            },
+            template_params: values.body,
+            content_text: renderedBody,
+          }),
+        });
+
+        const payload = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const reason = payload?.error || `HTTP ${res.status}`;
+          console.error("Failed to send template:", reason);
+          toast.error(`Failed to send template: ${reason}`);
+          onUpdateMessage(tempId, { status: "failed" });
+          return;
+        }
+
+        onUpdateMessage(tempId, { status: "sent" });
+      } catch (err) {
+        console.error("Failed to send template:", err);
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Failed to send template: ${reason}`);
+        onUpdateMessage(tempId, { status: "failed" });
+      }
+    },
+    [conversation, onNewMessage, onUpdateMessage],
+  );
+
+  // Build a quick id → Message map so reply quotes can be rendered without
+  // an extra fetch — the thread already holds the full conversation.
+  const messagesById = useMemo(() => {
+    const map = new Map<string, Message>();
+    for (const m of messages) map.set(m.id, m);
+    return map;
+  }, [messages]);
+
+  // Images + videos in the thread, in order — the set the media viewer
+  // pages through with ← / →.
+  const mediaGallery = useMemo(() => collectMediaGallery(messages), [messages]);
+
+  // Bucket reactions by their target message_id for O(1) per-bubble lookup.
+  const reactionsByMessageId = useMemo(() => {
+    const map = new Map<string, MessageReaction[]>();
+    for (const r of reactions) {
+      const bucket = map.get(r.message_id);
+      if (bucket) bucket.push(r);
+      else map.set(r.message_id, [r]);
+    }
+    return map;
+  }, [reactions]);
+
+  const contactDisplayName =
+    (typeof contact?.name === "string" &&
+      contact.name.trim() &&
+      !contact.name.includes("@lid") &&
+      !contact.name.includes("@s.whatsapp.net"))
+      ? contact.name.trim()
+      : (contact?.metadata &&
+         typeof (contact.metadata as any).pushName === "string" &&
+         (contact.metadata as any).pushName.trim())
+      ? (contact.metadata as any).pushName.trim()
+      : typeof contact?.phone === "string" && contact.phone.trim() && !contact.phone.includes("@lid") && !contact.phone.includes("@g.us")
+      ? contact.phone.trim()
+      : "WhatsApp Contact";
+
+  // Author label for a quoted message: "You" when we sent the parent,
+  // contact name when the customer sent it.
+  const authorLabelFor = useCallback(
+    (m: Message): string => {
+      const isAgentMsg =
+        m.sender_type === "agent" || m.sender_type === "bot";
+      return isAgentMsg ? "You" : contactDisplayName;
+    },
+    [contactDisplayName],
+  );
+
+  const handleStartReply = useCallback(
+    (msg: Message) => {
+      setReplyTo({
+        id: msg.id,
+        authorLabel: authorLabelFor(msg),
+        preview: buildReplyPreview(msg, tQuote),
+      });
+    },
+    [authorLabelFor],
+  );
+
+  // Single reaction-set primitive. emoji === "" removes; otherwise adds/swaps.
+  // The "toggle" semantic (pill click) is computed at the call site where the
+  // current reactions for the bubble are already in scope — keeps this
+  // function dependency-free w.r.t. the reaction list.
+  const postReaction = useCallback(
+    async (messageId: string, emoji: string) => {
+      if (!user?.id || !conversation) {
+        console.warn("[reactions] missing user or conversation");
+        return;
+      }
+      if (messageId.startsWith("temp-")) {
+        toast.error("Wait for the message to finish sending");
+        return;
+      }
+
+      const convId = conversation.id;
+      const userId = user.id;
+      let snapshot: MessageReaction[] = [];
+
+      // Functional updater — captures the freshest reactions list, never a
+      // stale closure. Snapshot stored for rollback on POST failure.
+      setReactions((prev) => {
+        snapshot = prev;
+        const own = prev.find(
+          (r) =>
+            r.message_id === messageId &&
+            r.actor_type === "agent" &&
+            r.actor_id === userId,
+        );
+        if (emoji === "") return own ? prev.filter((r) => r !== own) : prev;
+        if (own) return prev.map((r) => (r === own ? { ...own, emoji } : r));
+        return [
+          ...prev,
+          {
+            id: `temp-${Date.now()}`,
+            message_id: messageId,
+            conversation_id: convId,
+            actor_type: "agent",
+            actor_id: userId,
+            emoji,
+            created_at: new Date().toISOString(),
+          },
+        ];
+      });
+
+      try {
+        const res = await fetch("/api/whatsapp/react", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message_id: messageId, emoji }),
+        });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload?.error || `HTTP ${res.status}`);
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Reaction failed: ${reason}`);
+        setReactions(snapshot);
+      }
+    },
+    [conversation, user?.id],
+  );
+
+  const handleAssignChange = useCallback(
+    async (agentId: string | null) => {
+      if (!conversation) return;
+
+      const supabase = createClient();
+      const { error } = await supabase
+        .from("conversations")
+        .update({ assigned_agent_id: agentId })
+        .eq("id", conversation.id);
+
+      if (error) {
+        console.error("Failed to update assignment:", error);
+        toast.error("Failed to update assignment");
+        return;
+      }
+
+      onAssignChange(conversation.id, agentId);
+    },
+    [conversation, onAssignChange],
+  );
+
+  // Empty state — same WhatsApp-style doodle background as the active
+  // thread below, so swapping between empty/selected doesn't change the
+  // pattern under the user's eye.
+  if (!conversation || !contact) {
+    return (
+      <div className={cn("flex flex-1 flex-col items-center justify-center", DOODLE_BG_CLASSES)}>
+        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted">
+          <MessageCircle className="h-8 w-8 text-muted-foreground" />
+        </div>
+        <h3 className="mt-4 text-sm font-medium text-muted-foreground">
+          {t("selectConversation")}
+        </h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {t("selectConversationHint")}
+        </p>
+      </div>
+    );
+  }
+
+  const phoneStr = typeof contact.phone === "string" ? contact.phone.trim() : "";
+  const whatsappJid = typeof (contact as any).whatsapp_jid === "string" ? (contact as any).whatsapp_jid : "";
+  const metadataRemoteJid =
+    contact.metadata &&
+    typeof contact.metadata === "object" &&
+    typeof (contact.metadata as any).remoteJid === "string"
+      ? (contact.metadata as any).remoteJid
+      : "";
+
+  const isGroup =
+    conversation?.chat_type === "group" ||
+    phoneStr.includes("@g.us") ||
+    phoneStr.startsWith("120363") ||
+    phoneStr.startsWith("+120363") ||
+    whatsappJid.endsWith("@g.us") ||
+    metadataRemoteJid.endsWith("@g.us");
+
+  const displayName =
+    (typeof contact.name === "string" &&
+      contact.name.trim() &&
+      !contact.name.includes("@lid") &&
+      !contact.name.includes("@s.whatsapp.net"))
+      ? contact.name.trim()
+      : (contact.metadata &&
+         typeof (contact.metadata as any).pushName === "string" &&
+         (contact.metadata as any).pushName.trim())
+      ? (contact.metadata as any).pushName.trim()
+      : phoneStr && !phoneStr.includes("@lid") && !phoneStr.includes("@g.us")
+      ? phoneStr
+      : isGroup
+      ? "WhatsApp Group"
+      : "WhatsApp Contact";
+
+  const messageGroups = groupMessagesByDate(messages);
+  const currentStatus = STATUS_OPTIONS.find(
+    (s) => s.value === conversation.status
+  );
+
+  return (
+    // `min-w-0` is load-bearing: the page already puts min-w-0 on the
+    // thread's flex *wrapper* (issue #165), but this root keeps the
+    // default `min-width: auto`, so a single wide message (long unbroken
+    // URL/word) expands the whole thread past its flex share and the chat
+    // paints on top of the contact sidebar at lg+ — outgoing bubbles get
+    // clipped and the hover toolbar overlaps the Tags panel. Letting the
+    // root shrink lets the bubbles' break-words / max-w caps apply.
+    // Issue #257.
+    <div className={cn("flex min-w-0 flex-1 flex-col", DOODLE_BG_CLASSES)}>
+      {/* Header — solid card surface sits on top of the doodle so the
+          name/avatar/dropdowns stay legible. */}
+      <div className="flex items-center justify-between gap-1.5 sm:gap-2 border-b border-border bg-card px-2 py-2 sm:px-4 sm:py-2.5 min-w-0">
+        <div className="flex min-w-0 items-center gap-1 sm:gap-3 shrink">
+          {/* Back-to-list button — mobile only. Hidden on md+ where the
+              conversation list is visible next to the thread. */}
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label={t("backToConversations")}
+              className="flex h-8 w-8 sm:h-9 sm:w-9 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground md:hidden"
+            >
+              <ArrowLeft className="h-5 w-5" />
+            </button>
+          )}
+          
+          {/* Interactive contact header: tapping opens the mobile/tablet contact drawer */}
+          <div
+            onClick={() => setMobileContactOpen(true)}
+            className="flex items-center gap-2 sm:gap-3 min-w-0 cursor-pointer group/hdr rounded-lg py-1 px-1 -mx-1 hover:bg-muted/60 transition-colors"
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setMobileContactOpen(true);
+              }
+            }}
+            title="View contact info, tags, and notes"
+          >
+            {isGroup ? (
+              <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-teal-500/20 text-sm font-medium text-teal-400 group-hover/hdr:ring-2 group-hover/hdr:ring-primary/40 transition-all">
+                <Users className="h-4 w-4" />
+              </div>
+            ) : (
+              <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground group-hover/hdr:ring-2 group-hover/hdr:ring-primary/40 transition-all">
+                {(displayName.trim().charAt(0) || "W").toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0">
+              <h2 className="truncate text-sm font-semibold text-foreground flex items-center gap-1.5 group-hover/hdr:text-primary transition-colors">
+                {displayName}
+                {isGroup && (
+                  <span className="inline-flex items-center gap-0.5 rounded bg-teal-500/15 px-1.5 py-0.5 text-[9px] font-bold text-teal-500 border border-teal-500/30 shrink-0">
+                    <Users className="h-2.5 w-2.5" />
+                    Group
+                  </span>
+                )}
+                {contact.is_spam && (
+                  <span className="inline-flex items-center rounded bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-rose-500 border border-rose-500/20 uppercase tracking-wide shrink-0">
+                    Spam
+                  </span>
+                )}
+              </h2>
+              <p className="truncate text-xs text-muted-foreground">
+                {isGroup
+                  ? "WhatsApp Group"
+                  : phoneStr ||
+                    (metadataRemoteJid
+                      ? metadataRemoteJid.includes("@lid")
+                        ? "WhatsApp Direct"
+                        : metadataRemoteJid
+                      : "WhatsApp Contact")}
+              </p>
+            </div>
+          </div>
+
+          {/* Session timer badge — only relevant for Meta Cloud API where 24h window applies.
+              Direct phone QR lines do not have a 24-hour session limit. */}
+          {!isQrGateway && sessionInfo.remaining && (
+            <Badge
+              variant="outline"
+              className={cn(
+                "ml-1 hidden gap-1 border-border text-[10px] sm:inline-flex sm:ml-2",
+                sessionInfo.expired ? "text-red-400" : "text-primary"
+              )}
+            >
+              <Clock className="h-3 w-3" />
+              {sessionInfo.remaining}
+            </Badge>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          {/* Contact-panel toggle — desktop only */}
+          {onToggleContactPanel && (
+            <button
+              type="button"
+              onClick={onToggleContactPanel}
+              aria-label={
+                contactPanelOpen ? t("hideContactPanel") : t("showContactPanel")
+              }
+              title={contactPanelOpen ? t("hideContact") : t("showContact")}
+              aria-pressed={contactPanelOpen}
+              className={cn(
+                "hidden h-8 w-8 sm:h-9 sm:w-9 items-center justify-center rounded-md transition-colors hover:bg-muted hover:text-foreground lg:inline-flex",
+                contactPanelOpen ? "text-primary" : "text-muted-foreground",
+              )}
+            >
+              {contactPanelOpen ? (
+                <PanelRightClose className="h-4 w-4" />
+              ) : (
+                <PanelRightOpen className="h-4 w-4" />
+              )}
+            </button>
+          )}
+
+          {/* Log call / Phone button */}
+          {canLogCall && (
+            <button
+              type="button"
+              onClick={() => setLogCallOpen(true)}
+              aria-label={tCalls("logCall")}
+              title={tCalls("logCall")}
+              className="inline-flex h-8 w-8 sm:h-9 sm:w-9 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95"
+            >
+              <Phone className="h-4 w-4" />
+            </button>
+          )}
+
+          {/* WhatsApp-style 3-dots Menu (More options) */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              aria-label="More options"
+              title="More options"
+              className="inline-flex h-8 w-8 sm:h-9 sm:w-9 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95 focus:outline-none"
+            >
+              <MoreVertical className="h-4 w-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="w-52 border-border bg-popover shadow-lg"
+            >
+              {/* View contact info */}
+              <DropdownMenuItem
+                onClick={() => setMobileContactOpen(true)}
+                className="flex items-center gap-2.5 text-xs sm:text-sm cursor-pointer"
+              >
+                <Info className="h-4 w-4 text-muted-foreground" />
+                <span>Contact info</span>
+              </DropdownMenuItem>
+
+              {/* Refresh conversation */}
+              {onRefresh && (
+                <DropdownMenuItem
+                  onClick={handleRefreshClick}
+                  disabled={isRefreshing}
+                  className="flex items-center gap-2.5 text-xs sm:text-sm cursor-pointer"
+                >
+                  <RefreshCw className={cn("h-4 w-4 text-muted-foreground", isRefreshing && "animate-spin")} />
+                  <span>Refresh conversation</span>
+                </DropdownMenuItem>
+              )}
+
+              {/* Sync Chat History from WhatsApp */}
+              <DropdownMenuItem
+                onClick={handleSyncHistory}
+                disabled={isSyncingHistory}
+                className="flex items-center gap-2.5 text-xs sm:text-sm cursor-pointer"
+              >
+                <History className={cn("h-4 w-4 text-muted-foreground", isSyncingHistory && "animate-spin")} />
+                <span>{isSyncingHistory ? "Syncing history..." : "Sync history from phone"}</span>
+              </DropdownMenuItem>
+
+              <DropdownMenuSeparator className="bg-border my-1" />
+
+              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Chat Status
+              </div>
+
+              {STATUS_OPTIONS.map((opt) => {
+                const isSelected = conversation.status === opt.value;
+                return (
+                  <DropdownMenuItem
+                    key={opt.value}
+                    onClick={() => handleStatusChange(opt.value)}
+                    className={cn("flex items-center justify-between text-xs sm:text-sm cursor-pointer", opt.color)}
+                  >
+                    <span>{t(`status${opt.label}`)}</span>
+                    {isSelected && <Check className="h-3.5 w-3.5" />}
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </div>
+
+      {/* Messages Area */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-2 py-3 sm:px-4 sm:py-4">
+        {loading ? (
+          <div className="flex items-center justify-center py-12">
+            <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          </div>
+        ) : messages.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12">
+            <p className="text-sm text-muted-foreground">{t("noMessagesYet")}</p>
+            <p className="text-xs text-muted-foreground">
+              {t("sendTemplateHint")}
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {messageGroups.map((group) => (
+              <div key={group.date}>
+                {/* Date separator */}
+                <div className="mb-4 flex items-center justify-center">
+                  <span className="rounded-full bg-muted px-3 py-1 text-[10px] font-medium text-muted-foreground">
+                    {formatDateSeparator(group.date, t)}
+                  </span>
+                </div>
+                {/* Messages */}
+                <div className="space-y-2">
+                  {group.messages.map((msg) => {
+                    const parent = msg.reply_to_message_id
+                      ? messagesById.get(msg.reply_to_message_id)
+                      : null;
+                    const reply = parent
+                      ? {
+                          authorLabel:
+                            parent.sender_type === "agent" || parent.sender_type === "bot"
+                              ? t("me") 
+                              : contact?.name || contact?.phone || "Unknown",
+                          preview: buildReplyPreview(parent, tQuote),
+                        }
+                      : null;
+                    const msgReactions = reactionsByMessageId.get(msg.id);
+                    // Toggle is computed at the call site — `msgReactions`
+                    // and `user?.id` are already in scope, no extra hook.
+                    const handlePillToggle = (emoji: string) => {
+                      const own = msgReactions?.find(
+                        (r) =>
+                          r.actor_type === "agent" &&
+                          r.actor_id === user?.id,
+                      );
+                      const next = own?.emoji === emoji ? "" : emoji;
+                      void postReaction(msg.id, next);
+                    };
+                    if (msg.content_type === "call") {
+                      return <CallMessageChip key={msg.id} message={msg} />;
+                    }
+
+                    return (
+                      <MessageActions
+                        key={msg.id}
+                        message={msg}
+                        onReply={() => handleStartReply(msg)}
+                        onReact={(emoji) => {
+                          if (emoji) void postReaction(msg.id, emoji);
+                        }}
+                        onEdit={() => handleStartEdit(msg)}
+                      >
+                        <MessageBubble
+                          message={msg}
+                          reply={reply}
+                          reactions={msgReactions}
+                          currentUserId={user?.id}
+                          onToggleReaction={handlePillToggle}
+                          onOpenMedia={handleMediaChange}
+                        />
+                      </MessageActions>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* AI auto-reply banner — take over an active bot, or resume it
+          after a handoff. Renders nothing unless the account has
+          auto-reply configured. */}
+      <AiThreadBanner
+        conversationId={conversation.id}
+        disabled={conversation.ai_autoreply_disabled ?? false}
+        handoffSummary={conversation.ai_handoff_summary}
+        assignedAgentId={conversation.assigned_agent_id ?? null}
+        currentUserId={user?.id}
+        onChange={(patch) => {
+          if ("assigned_agent_id" in patch) {
+            onAssignChange(conversation.id, patch.assigned_agent_id ?? null);
+          }
+        }}
+      />
+
+      {/* Composer */}
+      {contact.is_spam ? (
+        <div className="flex h-16 items-center justify-center border-t border-border bg-muted/20 px-4 text-xs font-semibold text-rose-500 uppercase tracking-wide">
+          🚫 Cannot reply to a spam/blocked contact
+        </div>
+      ) : (
+        <MessageComposer
+          conversationId={conversation.id}
+          sessionExpired={isQrGateway ? false : sessionInfo.expired}
+          onSend={handleSend}
+          onSendMedia={handleSendMedia}
+          onSendInteractive={handleSendInteractive}
+          onOpenTemplates={handleOpenTemplates}
+          replyTo={replyTo}
+          onClearReply={() => setReplyTo(null)}
+          editingMessage={editingMessage}
+          onSaveEdit={handleSaveEdit}
+          onCancelEdit={handleCancelEdit}
+        />
+      )}
+
+      <TemplatePicker
+        open={templateModalOpen}
+        onOpenChange={setTemplateModalOpen}
+        onSelect={handleSendTemplate}
+      />
+
+      <LogCallDialog
+        open={logCallOpen}
+        onOpenChange={setLogCallOpen}
+        contactId={contact.id}
+        conversationId={conversation.id}
+        onCallLogged={onRefresh}
+      />
+
+      {/* Full-size viewer for the thread's images/videos. Renders nothing
+          until a bubble opens it. */}
+      <MediaLightbox
+        items={mediaGallery}
+        activeId={mediaMessageId}
+        onActiveIdChange={handleMediaChange}
+        contactLabel={contactDisplayName}
+      />
+
+      {/* Mobile & Tablet slide-out drawer for contact info, tags, notes & student 360 */}
+      <Sheet open={mobileContactOpen} onOpenChange={setMobileContactOpen}>
+        <SheetContent side="right" className="w-full sm:max-w-md p-0 border-l border-border bg-card">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Contact Details</SheetTitle>
+            <SheetDescription>Contact information, deals, and notes</SheetDescription>
+          </SheetHeader>
+          <div className="h-full pt-10 overflow-y-auto">
+            <ContactSidebar
+              contact={contact}
+              conversation={conversation}
+              salesMembers={salesMembers}
+              onAssignSalesMember={onAssignSalesMember}
+              className="w-full h-full border-none shadow-none"
+            />
+          </div>
+        </SheetContent>
+      </Sheet>
+    </div>
+  );
+}
