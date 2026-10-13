@@ -5,7 +5,7 @@
 Fortline CRM gives management centralized visibility into customer conversations handled by sales representatives while allowing the sales team to continue using their normal WhatsApp applications.
 
 <p align="center">
-  <img src="./public/logo.png" width="180" alt="Fortline-Pvt CRM">
+  <img src="./public/fortline-logo.png" width="180" alt="Fortline-Pvt CRM">
 </p>
 
 <p align="center">
